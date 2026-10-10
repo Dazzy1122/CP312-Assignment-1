@@ -1,8 +1,4 @@
 
-CHUNK = 4096
-MAX_LINE = 65536
-ENC = "utf-8"
-
 
 def send_line(sock, text):
     """Send one text line."""
