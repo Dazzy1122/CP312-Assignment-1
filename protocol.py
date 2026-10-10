@@ -1,12 +1,3 @@
-"""
-protocol.py - shared helpers for the text-based protocol.
-
-Every command/response is ONE line of UTF-8 text ending in "\n":
-    COMMAND: argument
-Responses start with "OK: ..." or "ERROR: ...".
-Raw file bytes are sent right after a line that announces them.
-Only socket-related stdlib is used here (no struct).
-"""
 
 CHUNK = 4096
 MAX_LINE = 65536
