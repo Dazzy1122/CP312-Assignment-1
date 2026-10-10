@@ -1,17 +1,23 @@
+"""
+server.py - TCP server for messaging and file transfer.
 
-import hashlib
+Usage: python3 server.py [host] [port]      (defaults 127.0.0.1 5000)
+
+Serves one client at a time. When a client leaves, waits for the next one.
+Stop with Ctrl+C.
+"""
+
 import json
 import os
 import socket
 import sys
 import time
 
-from protocol import CHUNK, parse_command, read_exact, read_line, send_line
+from protocol import file_sha256, parse_command, read_line, recv_file, send_file, send_line
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-USERS_FILE = "users.txt"
-STORAGE = "server_storage"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_FILE = os.path.join(BASE_DIR, "users.txt")
+STORAGE = os.path.join(BASE_DIR, "server_files")
 
 
 def log(tag, text):
@@ -23,52 +29,53 @@ def load_users():
         return {line.strip() for line in f if line.strip()}
 
 
+def list_files():
+    """Sorted [name, size] pairs for every finished file in storage."""
+    files = []
+    for name in sorted(os.listdir(STORAGE)):
+        path = os.path.join(STORAGE, name)
+        if os.path.isfile(path) and not name.endswith(".part"):
+            files.append([name, os.path.getsize(path)])
+    return files
+
+
 def do_upload(conn, rfile, arg):
     try:
-        name, size, digest = arg.split("|")
+        name, size, digest = arg.rsplit("|", 2)
         name = os.path.basename(name)
         size = int(size)
-        if not name or size < 0:
+        if name in ("", ".", "..") or size < 0:
             raise ValueError
     except ValueError:
         send_line(conn, "ERROR: Bad UPLOAD format. Use UPLOAD: name|size|sha256")
         return
-    os.makedirs(STORAGE, exist_ok=True)
     path = os.path.join(STORAGE, name)
     send_line(conn, "OK: READY")
-    sha = hashlib.sha256()
-    with open(path, "wb") as f:
-        for chunk in read_exact(rfile, size):
-            f.write(chunk)
-            sha.update(chunk)
-    if sha.hexdigest() != digest:
-        os.remove(path)
+    received = recv_file(rfile, path, size)
+    if received != digest:
+        os.remove(path + ".part")
         log("ERROR", f"Checksum mismatch for '{name}', discarded")
         send_line(conn, "ERROR: Checksum mismatch, file discarded")
     else:
-        log("FILE RECEIVED", f"'{name}' ({size} bytes) -> {path}")
+        os.replace(path + ".part", path)
+        log("FILE RECEIVED", f"'{name}' ({size} bytes)")
         send_line(conn, f"OK: File '{name}' uploaded ({size} bytes)")
 
 
 def do_download(conn, arg):
     name = os.path.basename(arg)
     path = os.path.join(STORAGE, name)
-    if not name or not os.path.isfile(path):
+    if name in ("", ".", "..") or name.endswith(".part") or not os.path.isfile(path):
+        log("ERROR", f"File not found: '{name}'")
         send_line(conn, f"ERROR: File '{name}' not found")
         return
-    sha = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(CHUNK), b""):
-            sha.update(chunk)
     size = os.path.getsize(path)
-    send_line(conn, f"OK: {size}|{sha.hexdigest()}")
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(CHUNK), b""):
-            conn.sendall(chunk)
+    send_line(conn, f"OK: {size}|{file_sha256(path)}")
+    send_file(conn, path)
     log("FILE SENT", f"'{name}' ({size} bytes)")
 
 
-def handle_client(conn, rfile):
+def handle_client(conn, rfile, users):
     user = None
     while True:
         line = read_line(rfile)
@@ -87,7 +94,9 @@ def handle_client(conn, rfile):
             send_line(conn, "OK: Goodbye")
             return
         elif cmd == "LOGIN":
-            if arg in load_users():
+            if not arg:
+                send_line(conn, "ERROR: Missing username")
+            elif arg in users:
                 user = arg
                 log("LOGIN", f"User '{user}' logged in")
                 send_line(conn, f"OK: Welcome {user}")
@@ -104,8 +113,7 @@ def handle_client(conn, rfile):
                     log("MESSAGE RECEIVED", f"{user}: {arg}")
                     send_line(conn, "OK: Message received")
             elif cmd == "LIST":
-                files = sorted(os.listdir(STORAGE)) if os.path.isdir(STORAGE) else []
-                send_line(conn, "OK: " + json.dumps(files))
+                send_line(conn, "OK: " + json.dumps(list_files()))
             elif cmd == "UPLOAD":
                 do_upload(conn, rfile, arg)
             elif cmd == "DOWNLOAD":
@@ -116,22 +124,38 @@ def handle_client(conn, rfile):
 
 
 def main():
+    try:
+        host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
+    except ValueError:
+        print("Usage: python3 server.py [host] [port]")
+        return
+    try:
+        users = load_users()
+    except FileNotFoundError:
+        print(f"Missing {USERS_FILE}. Create it with one username per line.")
+        return
+    os.makedirs(STORAGE, exist_ok=True)
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
+    try:
+        server.bind((host, port))
+    except OSError as e:
+        print(f"Could not start server on {host}:{port}: {e}")
+        server.close()
+        return
     server.listen(1)
-    log("SERVER", f"Listening on {HOST}:{PORT} (Ctrl+C to stop)")
+    log("SERVER", f"Listening on {host}:{port} (Ctrl+C to stop)")
     try:
         while True:
             conn, addr = server.accept()
             log("CLIENT CONNECTED", f"{addr[0]}:{addr[1]}")
             rfile = conn.makefile("rb")
             try:
-                handle_client(conn, rfile)
-            except (ConnectionError, OSError) as e:
+                handle_client(conn, rfile, users)
+            except OSError as e:  # includes ConnectionError and disk errors
                 log("ERROR", f"Connection problem: {e}")
-            except FileNotFoundError as e:
-                log("ERROR", f"Missing file: {e}")
             finally:
                 rfile.close()
                 conn.close()
